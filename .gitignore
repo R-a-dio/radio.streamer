@@ -1,5 +1,6 @@
 /.project
 /.pydevproject
+.ropeproject
 /.settings
 *.pyc
 /build
