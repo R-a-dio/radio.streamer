@@ -14,7 +14,7 @@ def test_dir(directory=u'/media/F/Music', files=None):
         try:
             filename = files.pop()
         except KeyError:
-            return (None, None)
+            return Song(None, None)
         if (filename.endswith('.flac') or
                 filename.endswith('.mp3') or
                 filename.endswith('.ogg')):

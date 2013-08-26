@@ -225,7 +225,17 @@ class PreloadedAudioFile(AudioFile):
         frame_buffer = []
 
         while True:
-            data = self._reader.read(self.total_frames)
+            try:
+                data = self._reader.read(self.total_frames)
+            except (ValueError):
+                # Most likely recoverable, try it
+                continue
+            except (IOError):
+                # Unrecoverable, get rid of this
+                # TODO: Check if we need to get rid of this or can use some of
+                # it.
+                raise
+
             if not data:
                 break
             frame_buffer.append(data.to_bytes(False, True))

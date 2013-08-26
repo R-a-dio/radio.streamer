@@ -109,10 +109,13 @@ class FileSource(object):
         try:
             data = self.audiofile.read(size, timeout)
         except (ValueError) as err:
-            if err.message == 'MD5 mismatch at end of stream':
-                return b''
-        except (AttributeError):
+            # A ValueError means a localized frame error, we return an empty
+            # byte string, and hope the next frame is correct.
             return b''
+        except (AttributeError, IOError) as err:
+            # If either of the two exceptions happen it's an unrecoverable
+            # error and we will want to stop with the current file.
+            data = b''
 
         if data == b'':
             self.audiofile.close()
