@@ -224,7 +224,7 @@ class PreloadedAudioFile(AudioFile):
 
         frame_buffer = []
 
-        while True:
+        while not self.finished.is_set():
             try:
                 data = self._reader.read(self.total_frames)
             except (ValueError):
@@ -245,7 +245,17 @@ class PreloadedAudioFile(AudioFile):
 
         self.finished.set()
 
-    def non_preload(self):
+    def non_preload(self, discard=True):
+        """
+        Gives out a non-preloaded audiofile, this is often only called
+        when the audiofile is required before preloading is finished.
+
+        The above 'often' is nearly guaranteed so we clean up our preloaded
+        file when this is called. If no cleaning up is required you can pass
+        'discard=False' as parameter.
+        """
+        if discard:
+            self.finished.set()
         return NormalAudioFile(self.song, self.manager, self.options)
 
     upper_progress = progress_function
