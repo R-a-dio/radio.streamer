@@ -11,305 +11,240 @@ from __future__ import unicode_literals
 from __future__ import print_function
 from __future__ import absolute_import
 
+from . import core
+from . import util
 from . import garbage
+from .util import Err
 
 import subprocess
-import threading
-import decimal
-import time
-import select
 import logging
+import select
+import decimal
+import os
 
 
-logger = logging.getLogger("streamer.encoder")
+logger = logging.getLogger(__name__)
 
-#: The path to the LAME binary. This can be just 'lame' on bash environments.
-LAME_BIN = 'lame'
+NoErr             = None
+CleanUp           = Err("CleanUp")
+NeedMoreData      = Err("NeedMoreData")
+NoMoreData        = Err("NoMoreData")
+RetryWithSameData = Err("RetryWithSameData")
 
 
-class Encoder(object):
+@util.call(b'')
+class NoData(bytes):
+    pass
+
+
+class LameError(Exception):
+    pass
+
+
+def lame_encoder(initial_data, select_timeout=3, read_size=4096, bitrate=192,
+                          sample_rate=44100, source_sample_rate=44100,
+                          source_bits_per_sample=24):
     """
-    An Encoder class that handles the encoder subprocess underneath.
+    Generator that returns a tuple containing (data, err):
 
-    Right now this class only supports encoding by using a LAME mp3 encoder
-    binary. Other formats are not supported.
+    `data` can either be:
+        1. `NoData` indicating there was no data to return
+        2. `bytes` mp3 audio data
 
-    .. note::
-        You should never use the :class:`EncoderInstance` class. The class
-        should only be used by the :class:`Encoder` class and touching the
-        :class:`EncoderInstance` instance used by the :class:`Encoder` class
-        can cause **undefined** behaviour.
+    `err` can be one of these:
+        1. NoErr: No error occured, you can continue reading
+        2. NeedMoredata: There isn't enough data to encode.
+        3. LameError instance indicates there was an unrecoverable error
+        4. RetryWithSameData: Indicates we could not write the data off and to
+                              prevent data loss, you will need to resend it.
+
+    It also accepts one of two things:
+
+        1. `bytes`: PCM audio data to encode to mp3
+        2. NoMoreData: Indicate to clean up resources and exit the generator.
+
+    parameters:
+        General:
+        - initial_data          : An initial `bytes` object to write.
+        - select_timeout        : The timeout in seconds to pass to `select.select`
+        - read_size             : The amount of bytes to read from `process.stdout`
+
+        MP3/Lame related:
+        - bitrate               : The resulting mp3's bitrate, CBR.
+        - sample_rate           : Sample rate of the resulting mp3
+        - source_sample_rate    : Sample rate of the PCM data
+        - bits_per_sample       : Amount of bits per sample in the PCM data
     """
-    options = {
-        'lame_settings': ['--cbr', '-b', '192', '--resample', '44.1'],
-    }
+    logger.debug("Starting new lame encoder instance: %s", repr(locals()))
+    arguments = [
+        'lame', '--quiet',
+        '--flush',
+        '-r',
+        '-s', str(decimal.Decimal(source_sample_rate) / 1000),
+        '--bitwidth', str(source_bits_per_sample),
+        '--signed', '--little-endian',
+        '-m', 'j',
+        '--cbr', '-b', str(bitrate),
+        '--resample',  str(decimal.Decimal(sample_rate) / 1000),
+        '-', '-',
+    ]
 
-    def __init__(self, manager, pipe, options):
-        """
-        ======
-        Source
-        ======
+    lame_stdin, stdin = create_pipes()
+    stdout, lame_stdout = create_pipes()
 
-        The source should have the following attributes:
+    try:
+        process = subprocess.Popen(
+            args=arguments,
+            stdin=lame_stdin,
+            stdout=lame_stdout,
+        )
+    except OSError as err:
+        if err.errno == 2:
+            print("You don't have LAME installed.")
 
-            :func:`read`:
-                :param size: An :const:`int` signifying the amount of
-                             bytes to return.
-                :returns: A :const:`bytes` of PCM audio data
-                          in supported format.
+        raise
+    else:
+        process.files = [
+            lame_stdin,
+            lame_stdout,
+            stdin,
+            stdout,
+        ]
 
-            :attr:`sample_rate`:
-                The sample rate of the audio data. This should be
-                the full integer of the sample rate (44100 instead
-                of 44.1)
+    data = initial_data
+    while True:
+        return_value, err_value = NoData, NoErr
 
-            :attr:`bits_per_sample`:
-                The bits per sample of the audio data. This
-                can be 16, 24 and 32 bits.
+        reader, writer, error = select.select(
+            [stdout],
+            [stdin],
+            [stdout, stdin],
+            select_timeout,
+        )
 
-        =======
-        Options
-        =======
+        if not reader and not writer and not error:
+            logger.debug("Nothing is ready")
+            err_value = NeedMoreData
 
-        The options available for the :class:`Encoder` is a single one named
-        'lame_settings'. This is a list of arguments to pass to the underlying
-        LAME encoder binary.
+        if error:
+            logger.debug(error)
 
-        The list should contain the encoding options of LAME only. Input and
-        other options are handled by the implementation.
+        if reader:
+            return_value = os.read(reader[0].fileno(), read_size)
+        else:
+            # There is nothing to read yet, so just keep
+            # asking for more data.
+            err_value = NeedMoreData
 
-        The default encoding options are CBR192 @ 44.1kHz and joint stereo.
-        Which looks like this:
-            ['--cbr', '-b', '192', '--resample', '44.1']
+        # Handle possible writes or lack of such
+        if writer:
+            try:
+                writer[0].write(data)
+            except (IOError, ValueError) as err:
+                logger.exception("LAME error occured")
+                err_value = LameError(str(err))
+            except:
+                logger.exception("LAME unknown error occured")
+                err_value = LameError(str(err))
+        else:
+            # We could not write due to the buffer being full,
+            # request that we get the same data as last time to
+            # try again.
+            err_value = RetryWithSameData
 
-        .. note::
-            The 'joint stereo' flag is implicitly set inside the class and
-            can't be changed through the :obj:`lame_settings`.
+        if isinstance(err_value, LameError):
+            # A LameError is unrecoverable in here, so we can clean
+            # ourself before returning.
+            SubprocessGarbage(process)
 
+        data = yield return_value, err_value
 
-        ========
-        Events
-        ========
-
-        The encoding pipe emits the following events:
-
-            - encoder_start:
-                Called when :meth:`Encoder.start` is called.
-
-                :param encoder: :class:`Encoder` instance.
-            - encoder_close:
-                Called when :meth:`Encoder.close` is called.
-
-                :param encoder: :class:`Encoder` instance.
-            - encoder_restart_before:
-                Called when a new :class:`EncoderInstance` needs to be created.
-                This is called **BEFORE** the instance is created.
-
-                :param encoder: :class:`Encoder` instance.
-            - encoder_restart_after:
-                Called when a new :class:`EncoderInstance` is created. This
-                is called **AFTER** the instance is created.
-
-                :param encoder: :class:`Encoder` instance.
-        """
-        super(Encoder, self).__init__()
-        self.alive = threading.Event()
-
-        self.manager = manager
-        self.source = pipe
-
-        #: The settings for encoding to pass to lame as a list.
-        self.settings = options['lame_settings']
-
-        # This is an implicit 'joint stereo' setting for lame.
-        self.mode = 'j'
-
-        self.out_file = '-'
-
-    def start(self):
-        """
-        This clears our `alive` flag and starts a new :class:`EncoderInstance`
-        instance by calling :meth:`start_instance`.
-        """
-        self.alive.clear()
-        self.start_instance()
-
-        self.manager.emit("encoder_start", self)
-
-    def close(self):
-        """
-        This calls the :meth:`EncoderInstance.close` method on the
-        :class:`EncoderInstance`.
-        """
-        self.alive.set()  # Set ourself to closed so we don't restart instance
-        if hasattr(self, 'instance'):
-            self.instance.close()
-
-        self.manager.emit("encoder_close", self)
-
-    def restart(self):
-        """
-        This method rather then restart, destroys and then recreates the
-        underlying :class:`EncoderInstance` instance.
-        """
-        # A kinda hackish way of restarting the instance.
-        # This is the easiest way of restarting the instance without actually
-        # calling `close` which would create a short time without encoder.
-        self.report_close()
-
-    def report_close(self):
-        """
-        This method is called by the :class:`EncoderInstance` class when it
-        gets closed or an error occurs in the instance. This should handle
-        the case gracefully and even restart the instance if the close was
-        unintentional by the user.
-
-        The method registers the :class:`EncoderInstance` instance for garbage
-        collection by the :mod:`garbage` module.
-        """
-        if not self.alive.is_set():
-            self.manager.emit("encoder_restart_before", self)
-
-            GarbageInstance(self.instance)
-            self.start_instance()
-
-            self.manager.emit("encoder_restart_after", self)
-
-    def start_instance(self):
-        """
-        This method is responsible for creating and starting the
-        :class:`EncoderInstance` class instances.
+        if data is NoMoreData or data is CleanUp:
+            SubprocessGarbage(process)
+            break
 
 
-        This creates a new :class:`EncoderInstance` instance and calls the
-        :meth:`EncoderInstance.start` method on it.
-
-        After the call to 'start' returns the new instance is assigned to
-        :attr:`instance`.
-        """
-        # Don't assign it to the instance directly because that would allow
-        # a different thread to accidently touch a non-started instance
-        new = EncoderInstance(self)
-        new.start()
-        self.instance = new
-
-    def __getattr__(self, key):
-        """
-        We are passed along as a source through the audio pipeline. This means
-        we are required to have some attributes that are often on the
-        :class:`EncoderInstance` instead of on :class:`Encoder`.
-
-        This delegates the attribute lookups we don't have to the
-        :class:`EncoderInstance` instead.
-        """
-        # This is to make sure we don't run into an infinite recursion. Since
-        # the below call to 'getattr' uses `self.instance`.
-        if key == 'instance':
-            raise AttributeError("No attribute named 'instance'")
-        return getattr(self.instance, key)
-
-
-# TODO: Document EncoderInstance properly.
-class EncoderInstance(object):
+@core.input("audio_pcm_data")
+@core.output("audio_mp3_data")
+@core.config(name="lame", redirect=lame_encoder, only_with_defaults=True)
+def encode_pcm_with_lame(pipe, **config):
     """
-    Class that represents a subprocessed encoder.
+    Encodes PCM audio data to MP3.
 
-    This is a non-generic class as of now and could be made generic and
-    supporting different kind of format encoders. As of yet this only supports
-    the LAME binary encoder.
-
-    .. note::
-        This class is used internally and should never be instantiated
-        directly by the user.
+    For possible `config` keys see `lame_encoder`.
     """
-    def __init__(self, encoder_manager):
-        super(EncoderInstance, self).__init__()
-        self.encoder_manager = encoder_manager
+    while True:
+        encoder = lame_encoder(b'', **config)
+        # Start the encoder
+        encoder.send(None)
 
-        for key in ['source', 'settings', 'mode', 'out_file']:
-            setattr(self, key, getattr(self.encoder_manager, key))
+        for data in pipe:
+            while True:
+                mp3_data, err = encoder.send(data)
 
-        self.running = threading.Event()
+                if err is RetryWithSameData:
+                    yield mp3_data
+                else:
+                    break
 
-    def run(self):
-        while not self.running.is_set():
-            data = self.source.read()
-            if data == b'':
-                # EOF we just sleep and wait for a new source
-                time.sleep(0.3)
-            self.write(data)
-        try:
-            self.process.stdin.close()
-            self.process.stdout.close()
-            self.process.wait()
-        except:
-            logger.exception("Failed to cleanly shutdown encoder.")
+            if err is NeedMoreData:
+                # Encoder needs more data to encode before we
+                # can read anything.
+                continue
+            elif isinstance(err, LameError):
+                # Something went wrong, we should go looking for a new
+                # encoder to use.
+                if mp3_data:
+                    yield mp3_data
+                break
 
-    def start(self):
-        self.running.clear()
-        arguments = [
-            LAME_BIN, '--quiet',
-            '--flush',
-            '-r',
-            '-s', str(decimal.Decimal(self.source.sample_rate) / 1000),
-            '--bitwidth', str(self.source.bits_per_sample),
-            '--signed', '--little-endian',
-            '-m', self.mode] + self.settings + ['-', self.out_file]
+            # We just got normal data, send it away
+            yield mp3_data
+        else:
+            # We ran dry our input pipe, make sure there is nothing left to read
+            # from the encoder, and then exit nicely
+            mp3_data, err = NoData, NoErr
+            while err == NoErr:
+                mp3_data, err = encoder.send(NoMoreData)
 
-        try:
-            self.process = subprocess.Popen(args=arguments,
-                                            stdin=subprocess.PIPE,
-                                            stdout=subprocess.PIPE)
-        except OSError as err:
-            if err.errno == 2:
-                logger.error("You don't have LAME installed.")
-                return
-            else:
-                raise
-        self.thread = threading.Thread(target=self.run,
-                                       name='Encoder Feeder')
-        self.thread.daemon = True
-        self.thread.start()
+                if mp3_data:
+                    yield mp3_data
 
-    def switch_source(self, new_source):
-        self.source = new_source
+            break
 
-    def write(self, data):
-        try:
-            self.process.stdin.write(data)
-        except (IOError, ValueError) as err:
-            logger.exception("Write failed, restarting encoder.")
-            self.close()
-            #raise EncodingError(str(err))
-        except (Exception) as err:
-            logger.exception("Write failed, unknown exception.")
-            self.close()
-            raise err
+        # Send a cleanup message
+        encoder.send(CleanUp)
 
-    def read(self, size=4096, timeout=10.0):
-        reader, writer, error = select.select([self.process.stdout],
-                                              [], [], timeout)
-        if not reader:
-            return b''
-        return reader[0].read(size)
-
-    def close(self):
-        self.running.set()
-        self.encoder_manager.report_close()
+    # Send a cleanup message since we break abruptly above.
+    encoder.send(CleanUp)
 
 
-# TODO: Document GarbageInstance properly.
-class GarbageInstance(garbage.Garbage):
+class SubprocessGarbage(garbage.Garbage):
     """
-    A garbage object to be registered for EncoderInstance class instances.
+    Garbage collection object for lame subprocesses.
     """
     def collect(self):
+        self.counter = getattr(self, 'counter', 0)
+
+        # Close all the fd's used for communicating
+        for f in self.item.files:
+            f.close()
+
         # Check if our encoder process is down yet
-        returncode = self.item.process.poll()
+        returncode = self.item.poll()
 
-        # Check if thread can be joined.
-        self.item.thread.join(0.0)
+        # If we're still around after 2 calls, just call kill and hope
+        # for the best.
+        #if self.counter >= 2:
+        #    self.item.kill()
 
-        if self.item.thread.isAlive() or returncode is None:
+        self.counter += 1
+
+        if returncode is None:
             return False
         return True
+
+
+def create_pipes():
+    i, o = os.pipe()
+    return os.fdopen(i, 'r'), os.fdopen(o, 'w')
